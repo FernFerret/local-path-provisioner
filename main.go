@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/signal"
@@ -15,7 +16,7 @@ import (
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
-	pvController "sigs.k8s.io/sig-storage-lib-external-provisioner/controller"
+	pvController "sigs.k8s.io/sig-storage-lib-external-provisioner/v6/controller"
 )
 
 var (
@@ -147,7 +148,7 @@ func loadConfig(kubeconfig string) (*rest.Config, error) {
 }
 
 func findConfigFileFromConfigMap(kubeClient clientset.Interface, namespace, configMapName, key string) (string, error) {
-	cm, err := kubeClient.CoreV1().ConfigMaps(namespace).Get(configMapName, metav1.GetOptions{})
+	cm, err := kubeClient.CoreV1().ConfigMaps(namespace).Get(context.TODO(), configMapName, metav1.GetOptions{})
 	if err != nil {
 		return "", err
 	}
@@ -222,7 +223,8 @@ func startDaemon(c *cli.Context) error {
 		}
 	}
 
-	provisioner, err := NewProvisioner(stopCh, kubeClient, configFile, namespace, helperImage, configMapName, serviceAccountName, helperPodYaml)
+	ctx := context.Background()
+	provisioner, err := NewProvisioner(ctx, kubeClient, configFile, namespace, helperImage, configMapName, serviceAccountName, helperPodYaml)
 	if err != nil {
 		return err
 	}
@@ -234,7 +236,7 @@ func startDaemon(c *cli.Context) error {
 		pvController.LeaderElection(false),
 	)
 	logrus.Debug("Provisioner started")
-	pc.Run(stopCh)
+	pc.Run(ctx)
 	logrus.Debug("Provisioner stopped")
 	return nil
 }

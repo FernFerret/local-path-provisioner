@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -17,7 +18,7 @@ import (
 	k8serror "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clientset "k8s.io/client-go/kubernetes"
-	pvController "sigs.k8s.io/sig-storage-lib-external-provisioner/controller"
+	pvController "sigs.k8s.io/sig-storage-lib-external-provisioner/v6/controller"
 )
 
 type ActionType string
@@ -42,7 +43,7 @@ var (
 )
 
 type LocalPathProvisioner struct {
-	stopCh             chan struct{}
+	ctx                context.Context
 	kubeClient         *clientset.Clientset
 	namespace          string
 	helperImage        string
@@ -73,10 +74,10 @@ type Config struct {
 	NodePathMap map[string]*NodePathMap
 }
 
-func NewProvisioner(stopCh chan struct{}, kubeClient *clientset.Clientset,
+func NewProvisioner(ctx context.Context, kubeClient *clientset.Clientset,
 	configFile, namespace, helperImage, configMapName, serviceAccountName, helperPodYaml string) (*LocalPathProvisioner, error) {
 	p := &LocalPathProvisioner{
-		stopCh: stopCh,
+		ctx: ctx,
 
 		kubeClient:         kubeClient,
 		namespace:          namespace,
@@ -141,7 +142,7 @@ func (p *LocalPathProvisioner) watchAndRefreshConfig() {
 				if err := p.refreshConfig(); err != nil {
 					logrus.Errorf("failed to load the new config file: %v", err)
 				}
-			case <-p.stopCh:
+			case <-p.ctx.Done():
 				logrus.Infof("stop watching config file")
 				return
 			}
@@ -177,24 +178,24 @@ func (p *LocalPathProvisioner) getRandomPathOnNode(node string) (string, error) 
 	return path, nil
 }
 
-func (p *LocalPathProvisioner) Provision(opts pvController.ProvisionOptions) (*v1.PersistentVolume, error) {
+func (p *LocalPathProvisioner) Provision(ctx context.Context, opts pvController.ProvisionOptions) (*v1.PersistentVolume, pvController.ProvisioningState, error) {
 	pvc := opts.PVC
 	if pvc.Spec.Selector != nil {
-		return nil, fmt.Errorf("claim.Spec.Selector is not supported")
+		return nil, pvController.ProvisioningNoChange, fmt.Errorf("claim.Spec.Selector is not supported")
 	}
 	for _, accessMode := range pvc.Spec.AccessModes {
 		if accessMode != v1.ReadWriteOnce {
-			return nil, fmt.Errorf("Only support ReadWriteOnce access mode")
+			return nil, pvController.ProvisioningNoChange, fmt.Errorf("Only support ReadWriteOnce access mode")
 		}
 	}
 	node := opts.SelectedNode
 	if opts.SelectedNode == nil {
-		return nil, fmt.Errorf("configuration error, no node was specified")
+		return nil, pvController.ProvisioningNoChange, fmt.Errorf("configuration error, no node was specified")
 	}
 
 	basePath, err := p.getRandomPathOnNode(node.Name)
 	if err != nil {
-		return nil, err
+		return nil, pvController.ProvisioningNoChange, err
 	}
 
 	name := opts.PVName
@@ -211,7 +212,7 @@ func (p *LocalPathProvisioner) Provision(opts pvController.ProvisionOptions) (*v
 		"/script/setup",
 	}
 	if err := p.createHelperPod(ActionTypeCreate, createCmdsForPath, name, path, node.Name, volMode, storage.Value()); err != nil {
-		return nil, err
+		return nil, pvController.ProvisioningNoChange, err
 	}
 
 	fs := v1.PersistentVolumeFilesystem
@@ -223,32 +224,33 @@ func (p *LocalPathProvisioner) Provision(opts pvController.ProvisionOptions) (*v
 	}
 
 	return &v1.PersistentVolume{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: name,
-		},
-		Spec: v1.PersistentVolumeSpec{
-			PersistentVolumeReclaimPolicy: *opts.StorageClass.ReclaimPolicy,
-			AccessModes:                   pvc.Spec.AccessModes,
-			VolumeMode:                    &fs,
-			Capacity: v1.ResourceList{
-				v1.ResourceName(v1.ResourceStorage): pvc.Spec.Resources.Requests[v1.ResourceName(v1.ResourceStorage)],
+			ObjectMeta: metav1.ObjectMeta{
+				Name: name,
 			},
-			PersistentVolumeSource: v1.PersistentVolumeSource{
-				HostPath: &v1.HostPathVolumeSource{
-					Path: path,
-					Type: &hostPathType,
+			Spec: v1.PersistentVolumeSpec{
+				PersistentVolumeReclaimPolicy: *opts.StorageClass.ReclaimPolicy,
+				AccessModes:                   pvc.Spec.AccessModes,
+				VolumeMode:                    &fs,
+				Capacity: v1.ResourceList{
+					v1.ResourceName(v1.ResourceStorage): pvc.Spec.Resources.Requests[v1.ResourceName(v1.ResourceStorage)],
 				},
-			},
-			NodeAffinity: &v1.VolumeNodeAffinity{
-				Required: &v1.NodeSelector{
-					NodeSelectorTerms: []v1.NodeSelectorTerm{
-						{
-							MatchExpressions: []v1.NodeSelectorRequirement{
-								{
-									Key:      KeyNode,
-									Operator: v1.NodeSelectorOpIn,
-									Values: []string{
-										valueNode,
+				PersistentVolumeSource: v1.PersistentVolumeSource{
+					HostPath: &v1.HostPathVolumeSource{
+						Path: path,
+						Type: &hostPathType,
+					},
+				},
+				NodeAffinity: &v1.VolumeNodeAffinity{
+					Required: &v1.NodeSelector{
+						NodeSelectorTerms: []v1.NodeSelectorTerm{
+							{
+								MatchExpressions: []v1.NodeSelectorRequirement{
+									{
+										Key:      KeyNode,
+										Operator: v1.NodeSelectorOpIn,
+										Values: []string{
+											valueNode,
+										},
 									},
 								},
 							},
@@ -257,10 +259,11 @@ func (p *LocalPathProvisioner) Provision(opts pvController.ProvisionOptions) (*v
 				},
 			},
 		},
-	}, nil
+		pvController.ProvisioningInBackground,
+		nil
 }
 
-func (p *LocalPathProvisioner) Delete(pv *v1.PersistentVolume) (err error) {
+func (p *LocalPathProvisioner) Delete(ctx context.Context, pv *v1.PersistentVolume) (err error) {
 	defer func() {
 		err = errors.Wrapf(err, "failed to delete volume %v", pv.Name)
 	}()
@@ -415,13 +418,13 @@ func (p *LocalPathProvisioner) createHelperPod(action ActionType, cmdsForPath []
 	// If it already exists due to some previous errors, the pod will be cleaned up later automatically
 	// https://github.com/rancher/local-path-provisioner/issues/27
 	logrus.Infof("create the helper pod %s into %s", helperPod.Name, p.namespace)
-	_, err = p.kubeClient.CoreV1().Pods(p.namespace).Create(helperPod)
+	_, err = p.kubeClient.CoreV1().Pods(p.namespace).Create(context.TODO(), helperPod, metav1.CreateOptions{})
 	if err != nil && !k8serror.IsAlreadyExists(err) {
 		return err
 	}
 
 	defer func() {
-		e := p.kubeClient.CoreV1().Pods(p.namespace).Delete(helperPod.Name, &metav1.DeleteOptions{})
+		e := p.kubeClient.CoreV1().Pods(p.namespace).Delete(context.TODO(), helperPod.Name, metav1.DeleteOptions{})
 		if e != nil {
 			logrus.Errorf("unable to delete the helper pod: %v", e)
 		}
@@ -429,7 +432,7 @@ func (p *LocalPathProvisioner) createHelperPod(action ActionType, cmdsForPath []
 
 	completed := false
 	for i := 0; i < CmdTimeoutCounts; i++ {
-		if pod, err := p.kubeClient.CoreV1().Pods(p.namespace).Get(helperPod.Name, metav1.GetOptions{}); err != nil {
+		if pod, err := p.kubeClient.CoreV1().Pods(p.namespace).Get(context.TODO(), helperPod.Name, metav1.GetOptions{}); err != nil {
 			return err
 		} else if pod.Status.Phase == v1.PodSucceeded {
 			completed = true
